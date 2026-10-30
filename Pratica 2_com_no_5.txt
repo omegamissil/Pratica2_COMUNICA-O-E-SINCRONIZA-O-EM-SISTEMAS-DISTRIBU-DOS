@@ -1,0 +1,208 @@
+import argparse
+import multiprocessing as mp
+import socket
+import threading
+import time
+from socketserver import ThreadingMixIn
+from xmlrpc.client import ServerProxy
+from xmlrpc.server import SimpleXMLRPCServer
+
+HOST = "127.0.0.1"
+
+
+class ServidorXMLRPC(ThreadingMixIn, SimpleXMLRPCServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class RegistroDeNomes:
+    """Mini diretório de serviços: nome lógico -> endereço da rede."""
+    def __init__(self, total_clientes=5):
+        self.servicos = {}
+        self.trava = threading.Lock()
+        self.barreira = threading.Condition()
+        self.chegaram = set()
+        self.total_clientes = total_clientes
+
+    def registrar(self, nome, endereco):
+        with self.trava:
+            self.servicos[nome] = endereco
+        return True
+
+    def descobrir(self, nome):
+        with self.trava:
+            return self.servicos.get(nome, "")
+
+    def aguardar_todos(self, participante):
+        """Barreira centralizada de 5 clientes via chamadas RPC."""
+        with self.barreira:
+            self.chegaram.add(participante)
+            if len(self.chegaram) == self.total_clientes:
+                self.barreira.notify_all()
+            else:
+                if not self.barreira.wait_for(
+                    lambda: len(self.chegaram) == self.total_clientes, timeout=8
+                ):
+                    return "TIMEOUT"
+        return "LIBERADO"
+
+
+def servidor_calculadora(conexao):
+    class Calculadora:
+        def somar(self, a, b):
+            return a + b
+
+        def multiplicar(self, a, b):
+            return a * b
+
+    with ServidorXMLRPC((HOST, 0), allow_none=True, logRequests=False) as servidor:
+        servidor.register_instance(Calculadora())
+        conexao.send(f"http://{HOST}:{servidor.server_address[1]}")
+        conexao.close()
+        servidor.serve_forever()
+
+
+def cliente_barreira(nome, endereco):
+    with ServerProxy(endereco, allow_none=True) as cliente:
+        print(f"[{nome}] entrou na barreira")
+        resultado = cliente.aguardar_todos(nome)
+        print(f"[{nome}] barreira: {resultado}")
+
+
+def demonstrar_rpc():
+    print("\n=== RPC + REGISTRO DE NOMES + BARREIRA (5 CLIENTES) ===")
+    with ServidorXMLRPC((HOST, 0), allow_none=True, logRequests=False) as servidor:
+        servidor.register_instance(RegistroDeNomes(total_clientes=5))
+        endereco_registro = f"http://{HOST}:{servidor.server_address[1]}"
+        thread = threading.Thread(target=servidor.serve_forever, daemon=True)
+        thread.start()
+        contexto = mp.get_context("spawn")
+        ponta_pai, ponta_filha = contexto.Pipe(duplex=False)
+        processo = contexto.Process(target=servidor_calculadora, args=(ponta_filha,))
+        processo.start()
+        ponta_filha.close()
+        try:
+            endereco_calc = ponta_pai.recv()  # publicado por processo real
+            with ServerProxy(endereco_registro, allow_none=True) as registro:
+                registro.registrar("calculadora", endereco_calc)
+                destino = registro.descobrir("calculadora")
+            print(f"[DNS didático] calculadora -> {destino}")
+            with ServerProxy(destino, allow_none=True) as calculadora:
+                print(f"[RPC] somar(6, 4) = {calculadora.somar(6, 4)}")
+                print(f"[RPC] multiplicar(6, 4) = {calculadora.multiplicar(6, 4)}")
+            print("[SINCRONIZAÇÃO] cinco clientes devem chegar à barreira")
+            clientes = [threading.Thread(target=cliente_barreira,
+                                         args=(f"cliente-{i}", endereco_registro))
+                        for i in range(1, 6)]
+            for cliente in clientes:
+                cliente.start()
+                time.sleep(0.1)
+            for cliente in clientes:
+                cliente.join(timeout=10)
+        finally:
+            ponta_pai.close()
+            if processo.is_alive():
+                processo.terminate()
+            processo.join(timeout=3)
+            servidor.shutdown()
+            thread.join(timeout=2)
+
+
+class Relogio:
+    def __init__(self, nome, indice, total=5):
+        self.nome = nome
+        self.indice = indice
+        self.lamport = 0
+        self.vetor = [0] * total
+
+    def evento(self):
+        self.lamport += 1
+        self.vetor[self.indice] += 1
+        return self.lamport, self.vetor.copy()
+
+    def enviar(self):
+        return self.evento()
+
+    def receber(self, timestamp):
+        lamport_remoto, vetor_remoto = timestamp
+        self.lamport = max(self.lamport, lamport_remoto) + 1
+        self.vetor = [max(a, b) for a, b in zip(self.vetor, vetor_remoto)]
+        self.vetor[self.indice] += 1
+        return self.lamport, self.vetor.copy()
+
+
+def precede(a, b):
+    return all(x <= y for x, y in zip(a, b)) and any(
+        x < y for x, y in zip(a, b)
+    )
+
+
+def demonstrar_relogios():
+    print("\n=== RELÓGIOS DE LAMPORT E VETORIAIS (5 NÓS) ===")
+    a, b = Relogio("A", 0, total=5), Relogio("B", 1, total=5)
+    evento_a = a.evento()
+    evento_b = b.evento()
+    print(f"Evento independente A: L={evento_a[0]}, V={evento_a[1]}")
+    print(f"Evento independente B: L={evento_b[0]}, V={evento_b[1]}")
+    concorrentes = not precede(evento_a[1], evento_b[1]) and not precede(
+        evento_b[1], evento_a[1]
+    )
+    print(f"Eventos A e B concorrentes? {concorrentes}")
+    mensagem = a.enviar()
+    print(f"A envia mensagem: L={mensagem[0]}, V={mensagem[1]}")
+    recebido = b.receber(mensagem)
+    print(f"B recebe mensagem: L={recebido[0]}, V={recebido[1]}")
+    print(f"Envio precede recebimento? {precede(mensagem[1], recebido[1])}")
+
+
+def demonstrar_eleicao():
+    print("\n=== ELEIÇÃO BULLY (5 NÓS NA SIMULAÇÃO) ===")
+    # Incluindo o nó 5 (ativo por padrão, ou ajuste conforme desejado)
+    situacao = {1: True, 2: True, 3: True, 4: False, 5: True}
+    print("Nó 4 está indisponível; nó 5 está ativo. Nó 1 percebe a falha do coordenador anterior.")
+
+    def eleger(iniciador):
+        superiores = [i for i in situacao if i > iniciador]
+        print(f"Nó {iniciador} -> ELECTION para {superiores}")
+        respostas = [i for i in superiores if situacao[i]]
+        if respostas:
+            print(f"Nó {iniciador} <- OK dos nós {respostas}")
+            return eleger(max(respostas))
+        print(f"Nó {iniciador} não recebe OK de nó superior.")
+        return iniciador
+
+    vencedor = eleger(1)
+    print(f"COORDENADOR anunciado por mensagem: nó {vencedor}")
+    print("Hipótese: participantes e prioridades são conhecidos; falhas por parada.")
+
+
+def demonstrar_maioria():
+    print("\n=== QUÓRUM DE MAIORIA COM 5 NÓS ===")
+    votos = {1: "APROVAR", 2: "APROVAR", 3: "RECUSAR", 4: "APROVAR", 5: "RECUSAR"}
+    quantidade = len(votos)
+    quorum = quantidade // 2 + 1
+    favoraveis = sum(voto == "APROVAR" for voto in votos.values())
+    print(f"Votos: {votos} | quórum necessário: {quorum}")
+    print(f"Proposta aprovada nesta rodada? {favoraveis >= quorum}")
+    print("Atenção: votação por maioria não implementa, sozinha, "
+          "replicação de log, termos nem segurança de consenso distribuído.")
+
+
+def main():
+    argumentos = argparse.ArgumentParser(description=__doc__)
+    argumentos.add_argument("--modo", default="todos",
+                            choices=("todos", "rpc", "relogios", "eleicao", "maioria"))
+    modo = argumentos.parse_args().modo
+    if modo in ("todos", "rpc"):
+        demonstrar_rpc()
+    if modo in ("todos", "relogios"):
+        demonstrar_relogios()
+    if modo in ("todos", "eleicao"):
+        demonstrar_eleicao()
+    if modo in ("todos", "maioria"):
+        demonstrar_maioria()
+
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    main()
