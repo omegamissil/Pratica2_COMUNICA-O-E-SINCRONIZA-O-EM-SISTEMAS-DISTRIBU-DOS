@@ -1,0 +1,1 @@
+Este repositório apresenta um laboratório prático e didático em Python focado nos principais pilares de Sistemas Distribuídos: descoberta de serviços, chamadas de procedimentos remotos (RPC), barreiras de sincronização, relógios lógicos (Lamport e vetoriais), algoritmos de eleição de líder e quóruns de votação.
